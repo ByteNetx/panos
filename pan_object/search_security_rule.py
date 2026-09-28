@@ -2,16 +2,20 @@
 """
 search_security_rules.py
 
-Search Panorama Security policy rules that reference a specific object
-(address, URL category, source user, application, service, etc.)
+Search Panorama Security policy rules that reference one or more objects
+(addresses, URL categories, source users, applications, services, …)
+
+Multiple object names can be supplied at once; a rule matches if it
+contains ANY of the provided names (OR semantics), and the match result
+records which names were found.
 
 Usage:
     python search_security_rules.py \
         --host panorama.example.com \
         --username admin \
         --password secret \
-        --object-type address \
-        --object-name web-servers
+        --object-type source-user \
+        --object-name 'CORP\\jdoe' 'CORP\\asmith' 'CORP\\bwayne'
 
 Dependencies:
     pan-os-python (pip install pan-os-python)
@@ -22,7 +26,7 @@ import json
 import logging
 import sys
 from dataclasses import dataclass, field, asdict
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from panos.panorama import Panorama
 from panos.policies import (
@@ -32,15 +36,15 @@ from panos.policies import (
     SecurityRule,
 )
 
-
 logger = logging.getLogger("rule-searcher")
-
 
 @dataclass
 class RuleMatch:
     """A single security rule that matched the search criteria."""
     scope: str
     rule_name: str
+    # Which of the searched object names were found, and in which attribute.
+    matched: Dict[str, List[str]] = field(default_factory=dict)
     source: List[str] = field(default_factory=list)
     destination: List[str] = field(default_factory=list)
     category: List[str] = field(default_factory=list)
@@ -53,11 +57,10 @@ class RuleMatch:
     def to_dict(self) -> Dict:
         return asdict(self)
 
-
 class PanoramaRuleSearcher:
     """
     Search Security policy rules on Panorama (pre-rulebase, post-rulebase,
-    and every device-group rulebase) for a referenced object.
+    and every device-group rulebase) for one or more referenced objects.
     """
 
     # Maps the user-facing object type to one or more SecurityRule attributes.
@@ -96,9 +99,6 @@ class PanoramaRuleSearcher:
             api_password=self.password,
         )
 
-        if self.api_version:
-            self._pano.add()
-
         self._pano.refresh_system_info()
         logger.info("Connected to Panorama %s", self.hostname)
         return self._pano
@@ -109,6 +109,7 @@ class PanoramaRuleSearcher:
             raise RuntimeError("Not connected. Call connect() first.")
         return self._pano
 
+    # -- Rule enumeration ---------------------------------------------------
     def iter_security_rules(self) -> Iterable[Tuple[str, SecurityRule]]:
         """
         Yield (scope_description, SecurityRule) for every security rule
@@ -116,7 +117,6 @@ class PanoramaRuleSearcher:
         """
         pano = self.panorama
 
-        # Panorama-level rulebases
         for scope, rulebase_cls in (
             ("Panorama pre-rulebase", PreRulebase),
             ("Panorama post-rulebase", PostRulebase),
@@ -125,7 +125,6 @@ class PanoramaRuleSearcher:
             for rule in SecurityRule.refreshall(rulebase):
                 yield scope, rule
 
-        # Device-group rulebases
         for dg in DeviceGroup.refreshall(pano):
             pano.add(dg)
             for label, rulebase_cls in (
@@ -137,6 +136,7 @@ class PanoramaRuleSearcher:
                 for rule in SecurityRule.refreshall(rulebase):
                     yield scope, rule
 
+    # -- Matching -----------------------------------------------------------
     @staticmethod
     def _as_list(value) -> List[str]:
         """Normalise a rule attribute (str or list) to a list of strings."""
@@ -149,27 +149,38 @@ class PanoramaRuleSearcher:
     def _rule_matches(
         self,
         rule: SecurityRule,
-        attributes: List[str],
-        object_name: str,
-    ) -> bool:
-        """Return True if any of the given attributes contain object_name."""
+        attributes: Sequence[str],
+        object_names: Sequence[str],
+    ) -> Dict[str, List[str]]:
+        """
+        Return a dict describing which object names were found, keyed by the
+        rule attribute in which they appear.
+
+        Example:
+            {"source_user": ["CORP\\jdoe", "CORP\\asmith"]}
+
+        An empty dict means no match.
+        """
+        hits: Dict[str, List[str]] = {}
+        wanted = set(object_names)
+
         for attr in attributes:
             members = self._as_list(getattr(rule, attr, None))
-            if object_name in members:
-                return True
-        return False
-
+            found_here = [name for name in members if name in wanted]
+            if found_here:
+                hits[attr] = found_here
+        return hits
 
     def search(
         self,
         object_type: str,
-        object_name: str,
+        object_names: Sequence[str],
     ) -> List[RuleMatch]:
         """
-        Search all security rules for the given object reference.
+        Search all security rules for the given object references.
 
         :param object_type: One of OBJECT_TYPE_MAP keys.
-        :param object_name: Name of the object to search for.
+        :param object_names: One or more names to search for (OR semantics).
         :returns: List of RuleMatch objects.
         """
         attributes = self.OBJECT_TYPE_MAP.get(object_type)
@@ -179,16 +190,28 @@ class PanoramaRuleSearcher:
                 f"Valid types: {', '.join(sorted(self.OBJECT_TYPE_MAP))}"
             )
 
-        logger.info("Searching for %s '%s' …", object_type, object_name)
+        if isinstance(object_names, str):
+            object_names = [object_names]
+        if not object_names:
+            raise ValueError("At least one object name is required.")
+
+        logger.info(
+            "Searching for %s: %s",
+            object_type,
+            ", ".join(repr(n) for n in object_names),
+        )
+
         matches: List[RuleMatch] = []
 
         for scope, rule in self.iter_security_rules():
-            if not self._rule_matches(rule, attributes, object_name):
+            hits = self._rule_matches(rule, attributes, object_names)
+            if not hits:
                 continue
 
             match = RuleMatch(
                 scope=scope,
                 rule_name=rule.name,
+                matched=hits,
                 source=self._as_list(rule.source),
                 destination=self._as_list(rule.destination),
                 category=self._as_list(rule.category),
@@ -199,10 +222,23 @@ class PanoramaRuleSearcher:
                 description=getattr(rule, "description", None),
             )
             matches.append(match)
-            logger.debug("Match in %s -> %s", scope, rule.name)
+            logger.debug(
+                "Match in %s -> %s (matched: %s)",
+                scope, rule.name, hits,
+            )
 
         logger.info("Found %d matching rule(s).", len(matches))
         return matches
+
+
+def _format_matched(matched: Dict[str, List[str]]) -> str:
+    """Render the matched dict as a compact one-line string."""
+    if not matched:
+        return "-"
+    return "; ".join(
+        f"{attr}=[{', '.join(names)}]"
+        for attr, names in matched.items()
+    )
 
 
 def print_matches(matches: List[RuleMatch]) -> None:
@@ -215,6 +251,7 @@ def print_matches(matches: List[RuleMatch]) -> None:
         print(f"[{idx}] Scope       : {m.scope}")
         print(f"    Rule        : {m.rule_name}")
         print(f"    Action      : {m.action}")
+        print(f"    Matched     : {_format_matched(m.matched)}")
         print(f"    Source      : {', '.join(m.source) or '-'}")
         print(f"    Destination : {', '.join(m.destination) or '-'}")
         print(f"    Category    : {', '.join(m.category) or '-'}")
@@ -232,10 +269,9 @@ def print_json(matches: List[RuleMatch]) -> None:
     print(json.dumps([m.to_dict() for m in matches], indent=2))
 
 
-# CLI
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Search Panorama security rules by referenced object."
+        description="Search Panorama security rules by referenced object(s)."
     )
     parser.add_argument("--host", required=True, help="Panorama IP / hostname")
     parser.add_argument("--username", required=True, help="Panorama username")
@@ -249,7 +285,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--object-name",
         required=True,
-        help="Name of the object (e.g. 'web-servers', 'social-networking')",
+        nargs="+",
+        help=(
+            "One or more object names to search for. "
+            "Pass multiple values space-separated, e.g. "
+            "--object-name 'CORP\\jdoe' 'CORP\\asmith' "
+            "(or repeat the flag; both work). "
+            "A rule matches if ANY name is found."
+        ),
     )
     parser.add_argument(
         "--format",
@@ -283,9 +326,28 @@ def configure_logging(verbosity: int) -> None:
     )
 
 
+def _flatten_object_names(values: Sequence[str]) -> List[str]:
+    """
+    Support both `--object-name A B C` and comma-separated
+    `--object-name A,B,C`. Deduplicates while preserving order.
+    """
+    names: List[str] = []
+    for v in values:
+        for part in v.split(","):
+            part = part.strip()
+            if part and part not in names:
+                names.append(part)
+    return names
+
+
 def main() -> int:
     args = build_arg_parser().parse_args()
     configure_logging(args.verbose)
+
+    object_names = _flatten_object_names(args.object_name)
+    if not object_names:
+        logger.error("No valid object names supplied.")
+        return 2
 
     searcher = PanoramaRuleSearcher(
         hostname=args.host,
@@ -296,7 +358,7 @@ def main() -> int:
 
     try:
         searcher.connect()
-        matches = searcher.search(args.object_type, args.object_name)
+        matches = searcher.search(args.object_type, object_names)
     except Exception as exc:
         logger.error("Search failed: %s", exc)
         return 1
