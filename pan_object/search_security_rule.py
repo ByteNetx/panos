@@ -326,17 +326,11 @@ def configure_logging(verbosity: int) -> None:
     )
 
 
-def _flatten_object_names(values: Sequence[str]) -> List[str]:
-    """
-    Support both `--object-name A B C` and comma-separated
-    `--object-name A,B,C`. Deduplicates while preserving order.
-    """
+def _object_names(values: Sequence[str]) -> List[str]:    
     names: List[str] = []
     for v in values:
-        for part in v.split(","):
-            part = part.strip()
-            if part and part not in names:
-                names.append(part)
+        if v and v not in names:
+            names.append(part)
     return names
 
 
@@ -344,7 +338,7 @@ def main() -> int:
     args = build_arg_parser().parse_args()
     configure_logging(args.verbose)
 
-    object_names = _flatten_object_names(args.object_name)
+    object_names = _object_names(args.object_name)
     if not object_names:
         logger.error("No valid object names supplied.")
         return 2
