@@ -133,9 +133,7 @@ class PanoramaManager:
         else:
             raise ValueError("Either api_key or username/password must be provided")
 
-    # ------------------------------------------------------------------
-    # Lookup / scope helpers
-    # ------------------------------------------------------------------
+    # --- Lookup Scope ------------------------------------------------------------
     def _get_device_group(self, device_group_name: str) -> Optional[DeviceGroup]:
         for dg in DeviceGroup.refreshall(self.panorama):
             if dg.name == device_group_name:
@@ -411,9 +409,7 @@ class PanoramaManager:
         else:
             logger.info("Updated candidate configuration. Changes not committed")
 
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
+    # --- Entry Point ---------------------------------------------------------------
     def run_operation(
         self, operation: str, cfg_data: Dict[str, Any]
     ) -> Dict[str, bool]:
@@ -446,9 +442,6 @@ class PanoramaManager:
             return results
 
 
-# ----------------------------------------------------------------------
-# CLI
-# ----------------------------------------------------------------------
 def parse_arguments():
     class Password(argparse.Action):
         def __call__(self, parser, namespace, values, option_string):
